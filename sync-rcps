@@ -159,7 +159,16 @@ def process_rcp_attachments(client, rcp_id, rcp_targets, dry_run, ous):
             printc(GREEN, "RCP detached.")
 
 
-def process_rcp(client, data, config_dir, dry_run, existing_rcps, ous):
+def decode_substitutions(str):
+    return [pair.split(':') for pair in str.split(',')]
+
+def perform_substitutions(str, substitutions):
+    for pair in substitutions:
+        str = str.replace(pair[0], pair[1])
+    return str
+
+
+def process_rcp(client, data, config_dir, dry_run, existing_rcps, ous, substitutions):
     rcp_name = data['name']
     rcp_description = data['description'].strip()
     rcp_path = os.path.join(config_dir, data['resource_file'])
@@ -176,6 +185,9 @@ def process_rcp(client, data, config_dir, dry_run, existing_rcps, ous):
 
     obj = json.loads(rcp_str)
     rcp_str = json.dumps(obj, separators=(',', ':'))
+
+    rcp_str = perform_substitutions(rcp_str, substitutions)
+
     rcp_length = len(rcp_str)
     if rcp_length > 5120:
         printc(RED, "Minified RCP length is {rcp_length} which exceeds 5120 characters. Skipping the RCP.")
@@ -202,7 +214,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config-dir', action='store', help='The directory containing the RCPs and the manifest')
     parser.add_argument('--dry-run', action='store_true', help='Perform a dry run')
+    parser.add_argument('--substitutions', action='store', help='Substitutions to perform in the RCPs, of the form from:to,from:to, etc')
     args = parser.parse_args()
+
+    substitutions = decode_substitutions(args.substitutions)
 
     if args.dry_run:
         printc(GREEN, "\nThis is a dry run. No changes will be made.")
@@ -220,7 +235,7 @@ def main():
     print()
 
     for rcp in manifest['rcps']:
-        process_rcp(client, rcp, args.config_dir, args.dry_run, existing_rcps, ous)
+        process_rcp(client, rcp, args.config_dir, args.dry_run, existing_rcps, ous, substitutions)
 
 
 

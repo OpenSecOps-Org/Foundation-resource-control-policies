@@ -6,4 +6,5 @@ part-of      = 'foundation'
 
 [[Script]]
 name         = 'sync-rcps'
-args         = [['--config-dir', '../Delegat-Install/apps/foundation/RCPs']]
+args         = [['--config-dir', '../Delegat-Install/apps/foundation/RCPs'],
+                ['--substitutions', '{substitutions}']]
