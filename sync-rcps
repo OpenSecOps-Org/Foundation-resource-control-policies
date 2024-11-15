@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import argparse
+import yaml
+import json
+import boto3
+
+
+# Define colors
+YELLOW = "\033[93m"
+LIGHT_BLUE = "\033[94m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+GRAY = "\033[90m"
+END = "\033[0m"
+BOLD = "\033[1m"
+
+def printc(color, string, **kwargs):
+    print(f"{color}{string}\033[K{END}", **kwargs)
+
+
+def check_aws_sso_session():
+    try:
+        # Try to get the user's identity
+        subprocess.run(['aws', 'sts', 'get-caller-identity'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        # If the command failed, the user is not logged in
+        printc(RED, "You do not have a valid AWS SSO session. Please run 'aws sso login' and try again.")
+        return False
+
+    # If the command succeeded, the user is logged in
+    return True
+
+
+def fetch_all_rcps(client):
+    printc(YELLOW, "Fetching list of all existing RCPs...")
+    paginator = client.get_paginator('list_policies')
+    rcps = {}
+
+    for page in paginator.paginate(Filter='RESOURCE_CONTROL_POLICY'):
+        for policy in page['Policies']:
+            rcps[policy['Name']] = policy
+
+    printc(YELLOW, f"There are {len(rcps)} RCPs in the system.")
+    return rcps
+
+
+def check_rcp_exists(rcp_name, rcps):
+    return rcps[rcp_name]['Id'] if rcp_name in rcps else None
+
+
+def rcp_does_exist(client, rcp_id, rcp_name, rcp_description, rcp_str, dry_run):
+    printc(GREEN, "Exists.")
+    if dry_run:
+        printc(GREEN, "Dry run enabled. Would have updated RCP.")
+    else:
+        printc(YELLOW, "Updating RCP...")
+        response = client.update_policy(
+            PolicyId=rcp_id,
+            Name=rcp_name,
+            Description=rcp_description,
+            Content=rcp_str,
+        )
+        printc(GREEN, "RCP updated.")
+
+
+def rcp_does_not_exist(client, rcp_name, rcp_description, rcp_str, dry_run):
+    printc(YELLOW, "Does not exist.")
+    if dry_run:
+        printc(GREEN, "Dry run enabled. Would have created RCP.")
+        return None
+    else:
+        printc(YELLOW, "Creating RCP...")
+        response = client.create_policy(
+            Content=rcp_str,
+            Description=rcp_description,
+            Name=rcp_name,
+            Type='RESOURCE_CONTROL_POLICY',
+        )
+        rcp_id = response['Policy']['PolicySummary']['Id']
+        printc(GREEN, f"RCP created with id: {rcp_id}")
+        return rcp_id
+
+
+def fetch_all_ous(client, parent_id=None, ous=None):
+    if ous is None:
+        ous = {}
+        printc(YELLOW, "Fetching list of all existing OUs...")
+
+    # Fetch the root ID if not provided
+    if parent_id is None:
+        roots = client.list_roots()
+        if roots['Roots']:
+            parent_id = roots['Roots'][0]['Id']
+            ous['Root'] = parent_id
+        else:
+            printc(RED, "No root found in the organization.")
+            return ous
+
+    # Fetch all OUs for the current parent
+    paginator = client.get_paginator('list_organizational_units_for_parent')
+    for page in paginator.paginate(ParentId=parent_id):
+        for ou in page['OrganizationalUnits']:
+            ous[ou['Name']] = ou['Id']
+
+            # Recursively fetch OUs for the current OU
+            fetch_all_ous(client, ou['Id'], ous)
+
+    return ous
+
+
+def fetch_all_attachments(client, rcp_id):
+    paginator = client.get_paginator('list_targets_for_policy')
+    attachments = []
+    for page in paginator.paginate(PolicyId=rcp_id):
+        for target in page['Targets']:
+            attachments.append(target['TargetId'])
+    return attachments
+
+
+def process_rcp_attachments(client, rcp_id, rcp_targets, dry_run, ous):
+    # Fetch all current attachments for the RCP
+    current_attachments = set(fetch_all_attachments(client, rcp_id))
+
+    # Prepare the desired attachments
+    desired_ou_attachments = {ous[ou_name]: ou_name for ou_name in rcp_targets.get('organizational_units', [])}
+    desired_account_attachments = set(rcp_targets.get('accounts', []))
+    desired_attachments = set(desired_ou_attachments.keys()).union(desired_account_attachments)
+
+    # Reverse mapping from OU IDs to names
+    ous_reverse = {v: k for k, v in ous.items()}
+
+    # Attachments to add are in desired but not in current
+    to_add = desired_attachments - current_attachments
+
+    # Attachments to remove are in current but not in desired
+    to_remove = current_attachments - desired_attachments
+
+    # Process attachments to add
+    for target_id in to_add:
+        target_name = ous_reverse.get(target_id, target_id)
+        if dry_run:
+            printc(GREEN, f"Dry run enabled. Would have attached RCP to target: {target_name}")
+        else:
+            printc(YELLOW, f"Attaching RCP to target: {target_name}")
+            client.attach_policy(PolicyId=rcp_id, TargetId=target_id)
+            printc(GREEN, "RCP attached.")
+
+    # Process attachments to remove
+    for target_id in to_remove:
+        target_name = ous_reverse.get(target_id, target_id)
+        if dry_run:
+            printc(GREEN, f"Dry run enabled. Would have detached RCP from target: {target_name}")
+        else:
+            printc(YELLOW, f"Detaching RCP from target: {target_name}")
+            client.detach_policy(PolicyId=rcp_id, TargetId=target_id)
+            printc(GREEN, "RCP detached.")
+
+
+def process_rcp(client, data, config_dir, dry_run, existing_rcps, ous):
+    rcp_name = data['name']
+    rcp_description = data['description'].strip()
+    rcp_path = os.path.join(config_dir, data['resource_file'])
+    rcp_targets = data['deployment_targets']
+
+    printc(LIGHT_BLUE, "--------------------------------------------------------------------------------")
+    printc(LIGHT_BLUE, rcp_name)
+    printc(LIGHT_BLUE, "--------------------------------------------------------------------------------")
+    printc(YELLOW, rcp_description)
+
+    # Read RCP file into 'rcp_str' variable
+    with open(rcp_path, 'r') as rcp_file:
+        rcp_str = rcp_file.read()
+
+    obj = json.loads(rcp_str)
+    rcp_str = json.dumps(obj, separators=(',', ':'))
+    rcp_length = len(rcp_str)
+    if rcp_length > 5120:
+        printc(RED, "Minified RCP length is {rcp_length} which exceeds 5120 characters. Skipping the RCP.")
+        return
+    printc(YELLOW, f"Minified RCP length: {rcp_length}")
+
+    # Check if RCP already exists
+    rcp_id = check_rcp_exists(rcp_name, existing_rcps)
+    if rcp_id:
+        rcp_does_exist(client, rcp_id, rcp_name, rcp_description, rcp_str, dry_run)
+    else:
+        rcp_id = rcp_does_not_exist(client, rcp_name, rcp_description, rcp_str, dry_run)
+
+    if rcp_id:
+        process_rcp_attachments(client, rcp_id, rcp_targets, dry_run, ous)
+    print()
+
+
+def main():
+    # Check that the user is logged in
+    if not check_aws_sso_session():
+        return
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config-dir', action='store', help='The directory containing the RCPs and the manifest')
+    parser.add_argument('--dry-run', action='store_true', help='Perform a dry run')
+    args = parser.parse_args()
+
+    if args.dry_run:
+        printc(GREEN, "\nThis is a dry run. No changes will be made.")
+
+    manifest_path = os.path.join(args.config_dir, 'manifest.yaml')
+    with open(manifest_path, 'r') as manifest_file:
+        manifest = yaml.safe_load(manifest_file)
+
+    client = boto3.client('organizations')
+
+    existing_rcps = fetch_all_rcps(client)
+    print()
+
+    ous = fetch_all_ous(client)
+    print()
+
+    for rcp in manifest['rcps']:
+        process_rcp(client, rcp, args.config_dir, args.dry_run, existing_rcps, ous)
+
+
+
+if __name__ == '__main__':
+    main()
