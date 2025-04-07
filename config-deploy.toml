@@ -6,5 +6,5 @@ part-of      = 'foundation'
 
 [[Script]]
 name         = 'sync-rcps'
-args         = [['--config-dir', '../CloudSecOps-Installer/apps/foundation/RCPs'],
+args         = [['--config-dir', '../Installer/apps/foundation/RCPs'],
                 ['--substitutions', '{substitutions}']]
