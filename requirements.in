@@ -1,0 +1,5 @@
+-r boto3.in
+
+# YAML parser used by sync-rcps to read RCP definitions from
+# Installer/apps/foundation/RCPs/*.yaml.
+pyyaml>=6.0,<7.0
